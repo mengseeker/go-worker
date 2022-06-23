@@ -614,7 +614,7 @@ func (r *RedisRunner) checkRunnerAlive(runnerID string) (bool, error) {
 	c, cancel := context.WithTimeout(context.Background(), RedisTimeout)
 	defer cancel()
 	val, err := r.redisCli.Get(c, KeyRunnerAlivePrefix+runnerID).Result()
-	if err != nil {
+	if err != nil && !errors.Is(err, redis.Nil) {
 		return false, fmt.Errorf("CheckRunnerAlive: %v", err)
 	}
 	if val == "alive" {
