@@ -31,6 +31,8 @@ const (
 	KeyReadyQueueLocker   = Prefix + "readyQueueLocker" // 就绪队列锁
 	KeyWaitingQueueLocker = Prefix + "waitingLocker"    // 等待队列锁
 	KeyWorkingCheckLocker = Prefix + "workingLocker"    // 工作空间状态检查锁
+	KeyTimerLocker        = Prefix + "timerLocker"      // 定时任务分配器锁
+	KeyTimerLastRunTime   = Prefix + "timeLastRunTime"  // 定时任务最后分配时间
 
 	KeyWorking                      = Prefix + "working" // 工作空间
 	WorkingCheckLockerTerm          = 6 * time.Minute    // 工作空间状态检查锁超时时间
@@ -80,6 +82,9 @@ type RedisRunner struct {
 
 	// 就绪队列加载worker数量
 	batchPull chan int
+
+	// 定时任务
+	TimerWorkers []TimerWorker
 }
 
 func NewRunner(redisCli *redis.Client, threads uint, logger Logger) (*RedisRunner, error) {
@@ -120,6 +125,9 @@ func (r *RedisRunner) RegistryWorker(work Worker) error {
 		return fmt.Errorf("worker %s has already registry", work.WorkerName())
 	}
 	r.RegistryWorkers[work.WorkerName()] = reflect.TypeOf(work).Elem()
+	if tw, ok := work.(TimerWorker); ok {
+		r.TimerWorkers = append(r.TimerWorkers, tw)
+	}
 	return nil
 }
 
@@ -127,7 +135,7 @@ func (r *RedisRunner) Run(ctx context.Context) error {
 	// 检查工作空间是否存在失败worker, 失败未处理worker重新投递
 	r.checkWorkingWorkers(ctx)
 
-	r.wg.Add(5)
+	r.wg.Add(6)
 	// 设置当前runner存活状态
 	go r.startRunnerAlive(ctx)
 	// 处理等待队列，将等待队列任务转移到就绪队列
@@ -138,6 +146,8 @@ func (r *RedisRunner) Run(ctx context.Context) error {
 	go r.startLoopExecWorker(ctx)
 	// 采集执行状态，通知信息
 	go r.startLoopCollect(ctx)
+	// 定时任务
+	go r.startTimerWorkers(ctx)
 
 	r.l.Infof("workerRunner start %v", r.ID)
 	<-ctx.Done()
@@ -664,4 +674,52 @@ func (r *RedisRunner) GetQueueLen(queue string) (int64, error) {
 
 func QueueKey(queue string) string {
 	return Prefix + "Queue_" + queue
+}
+
+func (r *RedisRunner) startTimerWorkers(ctx context.Context) {
+	r.l.Debug("TimerWorkers start")
+	defer r.l.Debug("TimerWorkers exit")
+	defer r.wg.Done()
+	r.setTimers(ctx)
+	tk := time.NewTicker(time.Minute)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-tk.C:
+			r.setTimers(ctx)
+		}
+	}
+}
+
+func (r *RedisRunner) setTimers(ctx context.Context) {
+	_, err := RedisLockV(r.redisCli, KeyTimerLocker, r.ID, time.Minute)
+	if err != nil {
+		if !errors.Is(err, ErrLockerAlreadySet) {
+			r.l.Errorf("setTimers err: %v", err)
+		}
+		return
+	}
+	// defer unlocker()
+	startTime := time.Now().Unix()
+	endTime := startTime + 2*60
+	// 获取上次启动时间
+	lastTime, err := r.redisCli.Get(ctx, KeyTimerLastRunTime).Int64()
+	if err == nil {
+		if startTime < lastTime {
+			startTime = lastTime
+		}
+	}
+	for _, tm := range r.TimerWorkers {
+		timer := tm.Timer()
+		for _, t := range timer.Catches(startTime, endTime) {
+			meta, err := r.Declare(tm, WithRetry(0), WithPerformAt(t))
+			if err != nil {
+				r.l.Errorf("%s Declare fail err: %v", meta, err)
+			}
+		}
+	}
+	if err = r.redisCli.Set(ctx, KeyTimerLastRunTime, endTime, 0).Err(); err != nil {
+		r.l.Errorf("setTimers err: %v", err)
+	}
 }
